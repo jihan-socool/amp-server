@@ -1,6 +1,6 @@
 endpoints:
-  - path: "/api/provider/openai/v1/chat/completions"
-    target_url: "https://api.openai.com/v1/chat/completions"
+  - path: "/api/provider/openai/v1/responses"
+    target_url: "https://api.openai.com/v1/responses"
     method: "POST"
     response_type: "stream"
     custom_headers: {}
@@ -61,4 +61,23 @@ endpoints:
       - "fireworks-speculation-prompt-tokens"
       - "fireworks-tokenizer-duration"
       - "fireworks-tokenizer-queue-duration"
+    enabled: true
+
+  # Google Generative Language (gemini)
+  # Matches: /api/provider/google/v1beta1/publishers/google/models/<model>:generateContent
+  # For example: /api/provider/google/v1beta1/publishers/google/models/gemini-2.5-flash-lite-preview-09-2025:generateContent
+  # Captures the remainder after /models/ as "rest"; the server derives {model} = rest.split(":").next()
+  - path: "/api/provider/google/v1beta1/publishers/google/models/{*rest}"
+    target_url: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    method: "POST"
+    response_type: "stream"
+    custom_headers: {}
+    forward_request_headers:
+      - "content-type"
+      - "user-agent"
+      - "accept"
+      - "accept-encoding"
+    forward_response_headers:
+      - "content-type"
+      - "cache-control"
     enabled: true

@@ -32,6 +32,8 @@ bytes = "1.0"
 # Utility libraries
 ulid = { version = "1.2" }
 chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
 
 [dependencies]
 amp-server-api = { path = "api" }
+dotenvy.workspace = true

@@ -1,6 +1,6 @@
-mod user;
-mod telemetry;
-mod proxy;
+pub mod user;
+pub mod telemetry;
+pub mod proxy;
 
 use anyhow::Result;
 use axum::Router;
@@ -15,26 +15,37 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::proxy::{ProxyConfig, ProxyService};
 
 static AMP_API_KEY: OnceLock<String> = OnceLock::new();
+static GOOGLE_API_KEY: OnceLock<String> = OnceLock::new();
 
 pub fn get_amp_api_key() -> &'static str {
     AMP_API_KEY.get().expect("AMP_API_KEY not initialized")
 }
 
+pub fn get_google_api_key() -> Option<&'static str> {
+    GOOGLE_API_KEY.get().map(|s| s.as_str())
+}
+
 #[tokio::main]
 async fn start() -> Result<()> {
+    // Load environment variables from .env file
+    dotenvy::dotenv().ok();
+
     // Initialize tracing
+    let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::registry()
-        .with(EnvFilter::new(
-            env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
+        .with(EnvFilter::new(rust_log))
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
 
-    // Load environment variables
+    // Load required environment variables
     let host = env::var("HOST").expect("HOST is not set in .env file");
     let port = env::var("PORT").expect("PORT is not set in .env file");
     let amp_api_key = env::var("AMP_API_KEY").expect("AMP_API_KEY is not set in .env file");
     AMP_API_KEY.set(amp_api_key).expect("AMP_API_KEY already initialized");
+    // Optional Google API key for Google proxy
+    if let Ok(google_api_key) = env::var("GOOGLE_API_KEY") {
+        let _ = GOOGLE_API_KEY.set(google_api_key);
+    }
     let server_url = format!("{host}:{port}");
     
     // Load proxy configuration
@@ -43,6 +54,11 @@ async fn start() -> Result<()> {
             info!("Using default proxy configuration ({})", e);
             ProxyConfig::default()
         });
+
+    info!("Loaded proxy configuration with {} endpoints", proxy_config.endpoints.len());
+    for endpoint in &proxy_config.endpoints {
+        info!("  - Path: {}, Response Type: {:?}", endpoint.path, endpoint.response_type);
+    }
     
     // Create proxy service
     let proxy_service = ProxyService::new(proxy_config);

@@ -1,22 +1,18 @@
-use async_stream::stream;
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::Request,
-    http::{HeaderMap, HeaderName, StatusCode, Method},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    http::{StatusCode, Method},
+    response::Response,
     routing::{get, post, put, delete},
 };
+use futures_util::StreamExt;
 use reqwest::Client;
-use std::convert::Infallible;
 use tracing::{error, info, warn};
-use serde_json::Value;
 
-use crate::get_amp_api_key;
-use super::config::{ProxyConfig, EndpointConfig, ResponseType};
+use std::collections::HashMap;
+use crate::{get_amp_api_key, get_google_api_key};
+use super::config::{ProxyConfig, EndpointConfig};
 
 pub struct ProxyService {
     config: ProxyConfig,
@@ -36,26 +32,61 @@ impl ProxyService {
             let endpoint_clone = endpoint.clone();
             let path = endpoint.path.clone();
 
-            match endpoint.method.to_uppercase().as_str() {
+            let method = endpoint.method.to_uppercase();
+            let has_wildcard = path.contains("{*");
+
+            match method.as_str() {
                 "GET" => {
-                    router = router.route(&path, get(move |req| {
-                        Self::handle_proxy_request(endpoint_clone, req)
-                    }));
+                    if has_wildcard {
+                        router = router.route(&path, get(move |axum::extract::Path(rest): axum::extract::Path<String>, req| {
+                            let mut params = HashMap::new();
+                            params.insert("rest".to_string(), rest);
+                            Self::handle_proxy_request_with_params(endpoint_clone, params, req)
+                        }));
+                    } else {
+                        router = router.route(&path, get(move |req| {
+                            Self::handle_proxy_request(endpoint_clone, req)
+                        }));
+                    }
                 }
                 "POST" => {
-                    router = router.route(&path, post(move |req| {
-                        Self::handle_proxy_request(endpoint_clone, req)
-                    }));
+                    if has_wildcard {
+                        router = router.route(&path, post(move |axum::extract::Path(rest): axum::extract::Path<String>, req| {
+                            let mut params = HashMap::new();
+                            params.insert("rest".to_string(), rest);
+                            Self::handle_proxy_request_with_params(endpoint_clone, params, req)
+                        }));
+                    } else {
+                        router = router.route(&path, post(move |req| {
+                            Self::handle_proxy_request(endpoint_clone, req)
+                        }));
+                    }
                 }
                 "PUT" => {
-                    router = router.route(&path, put(move |req| {
-                        Self::handle_proxy_request(endpoint_clone, req)
-                    }));
+                    if has_wildcard {
+                        router = router.route(&path, put(move |axum::extract::Path(rest): axum::extract::Path<String>, req| {
+                            let mut params = HashMap::new();
+                            params.insert("rest".to_string(), rest);
+                            Self::handle_proxy_request_with_params(endpoint_clone, params, req)
+                        }));
+                    } else {
+                        router = router.route(&path, put(move |req| {
+                            Self::handle_proxy_request(endpoint_clone, req)
+                        }));
+                    }
                 }
                 "DELETE" => {
-                    router = router.route(&path, delete(move |req| {
-                        Self::handle_proxy_request(endpoint_clone, req)
-                    }));
+                    if has_wildcard {
+                        router = router.route(&path, delete(move |axum::extract::Path(rest): axum::extract::Path<String>, req| {
+                            let mut params = HashMap::new();
+                            params.insert("rest".to_string(), rest);
+                            Self::handle_proxy_request_with_params(endpoint_clone, params, req)
+                        }));
+                    } else {
+                        router = router.route(&path, delete(move |req| {
+                            Self::handle_proxy_request(endpoint_clone, req)
+                        }));
+                    }
                 }
                 _ => {
                     warn!("Unsupported HTTP method: {} for path: {}", endpoint.method, endpoint.path);
@@ -66,11 +97,32 @@ impl ProxyService {
         router
     }
 
+    fn substitute_placeholders(template: &str, params: &HashMap<String, String>) -> String {
+        let mut out = template.to_string();
+        // Build a local copy with some normalized params
+        let mut norm = params.clone();
+        // If we have a "rest" and template wants {model}, try to derive it
+        if out.contains("{model}") {
+            if let Some(rest) = norm.get("rest").cloned() {
+                let model = rest.split(':').next().unwrap_or(rest.as_str()).to_string();
+                norm.insert("model".to_string(), model);
+            }
+        }
+        for (k, v) in norm.iter() {
+            let key = format!("{{{}}}", k);
+            if out.contains(&key) {
+                out = out.replace(&key, v);
+            }
+        }
+        out
+    }
+
     async fn handle_proxy_request(
         config: EndpointConfig,
         req: Request,
     ) -> Result<Response, (StatusCode, String)> {
-        info!("Forwarding request: {} -> {}", config.path, config.target_url);
+        let target_url = config.target_url.clone();
+        info!("Forwarding request: {} -> {}", config.path, target_url);
 
         let client = Client::new();
         let (parts, body) = req.into_parts();
@@ -89,7 +141,7 @@ impl ProxyService {
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid HTTP method".to_string()))?;
 
         let mut req_builder = client
-            .request(method, &config.target_url)
+            .request(method, &target_url)
             .body(body_bytes);
 
         // Add forwarded request headers
@@ -109,6 +161,15 @@ impl ProxyService {
             req_builder = req_builder.header("authorization", format!("Bearer {}", get_amp_api_key()));
         }
 
+        // Special handling: add Google API key header when proxying Google endpoints
+        if config.path.contains("/api/provider/google/") {
+            if let Some(key) = get_google_api_key() {
+                req_builder = req_builder.header("x-goog-api-key", key);
+            } else {
+                warn!("GOOGLE_API_KEY not set; skipping x-goog-api-key injection for {}", config.path);
+            }
+        }
+
         // Send request
         let response = match req_builder.send().await {
             Ok(resp) => resp,
@@ -123,74 +184,19 @@ impl ProxyService {
             return Err((StatusCode::BAD_GATEWAY, "Upstream server error".to_string()));
         }
 
-        // Handle based on response type
-        match config.response_type {
-            ResponseType::Sse => Self::handle_sse_response(response, &config).await,
-            ResponseType::Stream => Self::handle_stream_response(response, &config).await,
-            ResponseType::Json => Self::handle_json_response(response, &config).await,
-            ResponseType::Html => Self::handle_html_response(response, &config).await,
-        }
+        // Always forward as raw byte stream without any parsing
+        Self::handle_stream_response(response, &config).await
     }
 
-    async fn handle_sse_response(
-        response: reqwest::Response,
-        config: &EndpointConfig,
+    async fn handle_proxy_request_with_params(
+        mut config: EndpointConfig,
+        params: HashMap<String, String>,
+        req: Request,
     ) -> Result<Response, (StatusCode, String)> {
-        let mut response_headers = HeaderMap::new();
-        
-        // Forward response headers
-        for header_name in &config.forward_response_headers {
-            if let Some(header_value) = response.headers().get(header_name) {
-                if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
-                    response_headers.insert(name, header_value.clone());
-                }
-            }
-        }
-
-        let stream = stream! {
-            let mut bytes_stream = response.bytes_stream();
-            let mut buffer = Vec::new();
-
-            while let Some(chunk) = futures_util::StreamExt::next(&mut bytes_stream).await {
-                match chunk {
-                    Ok(bytes) => {
-                        buffer.extend_from_slice(&bytes);
-
-                        let text = String::from_utf8_lossy(&buffer);
-                        let lines_vec: Vec<&str> = text.lines().collect();
-
-                        if lines_vec.len() > 1 {
-                            for line in &lines_vec[..lines_vec.len()-1] {
-                                if let Some(data) = Self::parse_sse_line(line) {
-                                    yield Ok::<Event, Infallible>(Event::default().data(data));
-                                }
-                            }
-
-                            buffer = lines_vec.last().unwrap().as_bytes().to_vec();
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to read SSE response stream: {}", e);
-                        break;
-                    }
-                }
-            }
-
-            if !buffer.is_empty() {
-                let text = String::from_utf8_lossy(&buffer);
-                for line in text.lines() {
-                    if let Some(data) = Self::parse_sse_line(line) {
-                        yield Ok::<Event, Infallible>(Event::default().data(data));
-                    }
-                }
-            }
-        };
-
-        let sse_response = Sse::new(stream);
-        let mut final_response = sse_response.into_response();
-        final_response.headers_mut().extend(response_headers);
-
-        Ok(final_response)
+        // Compute target URL from template and params
+        let target = Self::substitute_placeholders(&config.target_url, &params);
+        config.target_url = target;
+        Self::handle_proxy_request(config, req).await
     }
 
     async fn handle_stream_response(
@@ -212,120 +218,18 @@ impl ProxyService {
             }
         }
 
-        // Check if it's a streaming response
-        let is_streaming = headers
-            .get("content-type")
-            .and_then(|ct| ct.to_str().ok())
-            .map(|ct| ct.contains("text/event-stream") || ct.contains("application/stream"))
-            .unwrap_or(false);
+        // Always forward as raw byte stream without parsing
+        let stream = response.bytes_stream().map(|result| {
+            result.map_err(std::io::Error::other)
+        });
+        let body = Body::from_stream(stream);
 
-        if is_streaming {
-            let stream = futures_util::StreamExt::map(response.bytes_stream(), |result| {
-                result.map_err(std::io::Error::other)
-            });
-            let body = Body::from_stream(stream);
-            
-            response_builder.body(body)
-                .map_err(|e| {
-                    error!("Failed to build streaming response: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build streaming response".to_string())
-                })
-        } else {
-            let body_bytes = response.bytes().await
-                .map_err(|e| {
-                    error!("Failed to read response body: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response".to_string())
-                })?;
-
-            response_builder.body(Body::from(body_bytes))
-                .map_err(|e| {
-                    error!("Failed to build response: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response".to_string())
-                })
-        }
-    }
-
-    async fn handle_json_response(
-        response: reqwest::Response,
-        config: &EndpointConfig,
-    ) -> Result<Response, (StatusCode, String)> {
-        let status = response.status();
-        let mut response_headers = HeaderMap::new();
-
-        // Forward response headers
-        for header_name in &config.forward_response_headers {
-            if let Some(header_value) = response.headers().get(header_name) {
-                if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
-                    response_headers.insert(name, header_value.clone());
-                }
-            }
-        }
-
-        let json_data: Value = response.json().await
+        response_builder.body(body)
             .map_err(|e| {
-                error!("Failed to parse JSON response: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse response".to_string())
-            })?;
-
-        let mut json_response = Json(json_data).into_response();
-        *json_response.status_mut() = status;
-        json_response.headers_mut().extend(response_headers);
-
-        Ok(json_response)
+                error!("Failed to build streaming response: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build streaming response".to_string())
+            })
     }
 
-    async fn handle_html_response(
-        response: reqwest::Response,
-        config: &EndpointConfig,
-    ) -> Result<Response, (StatusCode, String)> {
-        let status = response.status();
-        let mut response_headers = HeaderMap::new();
 
-        // Forward response headers
-        for header_name in &config.forward_response_headers {
-            if let Some(header_value) = response.headers().get(header_name) {
-                if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
-                    response_headers.insert(name, header_value.clone());
-                }
-            }
-        }
-
-        let html_text = response.text().await
-            .map_err(|e| {
-                error!("Failed to read HTML response: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read response".to_string())
-            })?;
-
-        let mut html_response = Response::builder()
-            .status(status)
-            .header("content-type", "text/html")
-            .body(Body::from(html_text))
-            .map_err(|e| {
-                error!("Failed to build HTML response: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to build response".to_string())
-            })?;
-
-        html_response.headers_mut().extend(response_headers);
-
-        Ok(html_response)
-    }
-
-    fn parse_sse_line(line: &str) -> Option<String> {
-        let line = line.trim();
-        if line.is_empty() {
-            return None;
-        }
-
-        if let Some(data_content) = line.strip_prefix("data: ") {
-            if data_content == "[DONE]" {
-                Some("[DONE]".to_string())
-            } else {
-                Some(data_content.to_string())
-            }
-        } else if let Some(stripped) = line.strip_prefix("data:") {
-            Some(stripped.to_string())
-        } else {
-            Some(line.to_string())
-        }
-    }
 }

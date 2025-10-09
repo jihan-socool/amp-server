@@ -28,4 +28,5 @@ bytes = { workspace = true }
 # Utility libraries
 ulid = { workspace = true }
 chrono = { workspace = true }
+dotenvy = { workspace = true }
 
